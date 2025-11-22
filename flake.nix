@@ -30,17 +30,19 @@
         devShells.default =
           with pkgs;
           mkShell {
-            buildInputs = [
+            nativeBuildInputs = [
               pkg-config
               openssl
+            ];
 
+            buildInputs = [
               vulkan-loader
               vulkan-headers
               vulkan-validation-layers
 
               libxkbcommon
-
               rustToolchain
+              wgsl-analyzer
             ]
             ++ (with xorg; [
               libX11
@@ -48,6 +50,8 @@
               libXrandr
               libXi
             ]);
+
+            LD_LIBRARY_PATH = "${vulkan-loader}/lib";
           };
       }
     );
