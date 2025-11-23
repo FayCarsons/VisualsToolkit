@@ -32,15 +32,20 @@
           mkShell {
             nativeBuildInputs = [
               pkg-config
-              openssl
-            ];
 
-            buildInputs = [
+              # graphics
               vulkan-loader
               vulkan-headers
               vulkan-validation-layers
-
+              wayland
+              wayland-protocols
+              wayland-scanner
               libxkbcommon
+
+              # audio
+              alsa-lib
+              jack2
+
               rustToolchain
               wgsl-analyzer
             ]

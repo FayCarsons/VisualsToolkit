@@ -1,240 +1,401 @@
-use std::num::NonZeroU32;
-use wgpu::{Features, util::DeviceExt};
+mod analysis;
 
-// These are set by the minimum required defaults for webgpu.
-const MAX_BUFFER_SIZE: u64 = 1 << 27; // 134_217_728 // 134MB
-const MAX_DISPATCH_SIZE: u32 = (1 << 16) - 1;
+use cpal::traits::StreamTrait;
+use std::{sync::Arc, time::Instant};
+use thingbuf::mpsc::{self, blocking::Receiver};
+use winit::{
+    application::ApplicationHandler,
+    dpi::PhysicalSize,
+    event::*,
+    event_loop::{ControlFlow, EventLoop},
+    window::Window,
+};
 
-pub async fn execute_gpu(numbers: &[f32]) -> Vec<f32> {
-    let instance = wgpu::Instance::default();
+use crate::analysis::Frame;
 
-    let adapter = instance
-        .request_adapter(&wgpu::RequestAdapterOptions::default())
-        .await
-        .unwrap();
+#[derive(Debug)]
+enum App<'a> {
+    Uninit(Option<Receiver<Frame>>), // Sucks, always `Some` but we need to be able to take it
+    Init(AppInner<'a>),
+}
 
-    let (device, queue) = adapter
-        .request_device(&wgpu::DeviceDescriptor {
-            label: None,
-            // These features are required to use `binding_array` in your wgsl.
-            // Without them your shader may fail to compile.
-            required_features: Features::BUFFER_BINDING_ARRAY
-                | Features::STORAGE_RESOURCE_BINDING_ARRAY
-                | Features::SAMPLED_TEXTURE_AND_STORAGE_BUFFER_ARRAY_NON_UNIFORM_INDEXING,
-            memory_hints: wgpu::MemoryHints::Performance,
-            required_limits: wgpu::Limits {
-                max_buffer_size: MAX_BUFFER_SIZE,
-                max_binding_array_elements_per_shader_stage: 8,
+impl App<'_> {
+    fn new(recv: Receiver<Frame>) -> Self {
+        Self::Uninit(Some(recv))
+    }
+}
+
+#[derive(Debug)]
+struct AppInner<'a> {
+    window: Arc<Window>,
+    state: &'a mut State<'a>,
+    last_time: Instant,
+    audio_analysis_frames: Receiver<Frame>,
+}
+
+impl<'a> AppInner<'a> {
+    fn new(
+        state: &'a mut State<'a>,
+        window: Arc<Window>,
+        audio_analysis_frames: Receiver<Frame>,
+    ) -> Self {
+        Self {
+            window,
+            state,
+            last_time: Instant::now(),
+            audio_analysis_frames,
+        }
+    }
+}
+
+impl ApplicationHandler for App<'_> {
+    fn resumed(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
+        if let Self::Uninit(recv) = self {
+            let window_attributes = Window::default_attributes()
+                .with_title("Volumetric Raymarch")
+                .with_inner_size(winit::dpi::LogicalSize::new(1280, 720));
+
+            let window = Arc::new(event_loop.create_window(window_attributes).unwrap());
+            let state = Box::leak(Box::new(pollster::block_on(State::new(window.clone()))));
+
+            let inner = AppInner::new(state, window, recv.take().unwrap());
+            *self = Self::Init(inner);
+        }
+    }
+
+    fn window_event(
+        &mut self,
+        event_loop: &winit::event_loop::ActiveEventLoop,
+        window_id: winit::window::WindowId,
+        event: WindowEvent,
+    ) {
+        match self {
+            Self::Uninit(_) => {}
+            Self::Init(inner) => {
+                if inner.window.id() != window_id {
+                    return;
+                }
+
+                match event {
+                    WindowEvent::Resized(size) => inner.state.resize(size),
+                    WindowEvent::RedrawRequested => {
+                        let now = std::time::Instant::now();
+                        let dt = (now - inner.last_time).as_secs_f32();
+
+                        inner.last_time = now;
+
+                        inner.state.update(dt);
+
+                        if let Err(err) = inner.state.render() {
+                            match err {
+                                wgpu::SurfaceError::OutOfMemory => {
+                                    event_loop.exit();
+                                    panic!("OUT OF MEMORY");
+                                }
+                                wgpu::SurfaceError::Lost => {
+                                    inner.state.resize(inner.state.size);
+                                }
+                                e => eprintln!("[ERROR]: {e}"),
+                            }
+                        }
+                    }
+                    WindowEvent::CloseRequested => event_loop.exit(),
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    fn about_to_wait(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
+        if let Self::Init(inner) = self {
+            inner.window.request_redraw();
+        }
+    }
+}
+
+#[derive(Debug)]
+struct State<'window> {
+    surface: wgpu::Surface<'window>,
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    config: wgpu::SurfaceConfiguration,
+    size: winit::dpi::PhysicalSize<u32>,
+    render_pipeline: wgpu::RenderPipeline,
+    uniform_buffer: wgpu::Buffer,
+    bind_group: wgpu::BindGroup,
+    volume_tex: wgpu::Texture,
+    volume_view: wgpu::TextureView,
+    sampler: wgpu::Sampler,
+    time: f32,
+}
+
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy, bytemuck::Zeroable, bytemuck::NoUninit)]
+struct Uniforms {
+    resolution: [f32; 2],
+    time: f32,
+    __pad: f32,
+}
+
+impl Uniforms {
+    fn new(width: f32, height: f32, time: f32) -> Self {
+        Self {
+            resolution: [width, height],
+            time,
+            ..Default::default()
+        }
+    }
+}
+
+impl<'window> State<'window> {
+    async fn new(window: Arc<Window>) -> Self {
+        let size = window.inner_size();
+
+        let instance = wgpu::Instance::default();
+        let surface = instance.create_surface(window).expect("CREATE SURFACE");
+
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                compatible_surface: Some(&surface),
+                force_fallback_adapter: false,
+            })
+            .await
+            .expect("FIND ADAPTER");
+
+        let (device, queue) = adapter
+            .request_device(&Default::default())
+            .await
+            .expect("CREATE DEVICE");
+
+        // let surface_caps = surface.get_capabilities(&adapter);
+        // let surface_format = surface_caps
+        //     .formats
+        //     .iter()
+        //     .find(|f| f.is_srgb())
+        //     .copied()
+        //     .unwrap_or(surface_caps.formats[0]);
+
+        let config = surface
+            .get_default_config(&adapter, size.width, size.height)
+            .expect("GET SURFACE CONFIG");
+
+        surface.configure(&device, &config);
+
+        const TEX_SIZE: u32 = 64;
+        let volume_tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Volume Texture"),
+            size: wgpu::Extent3d {
+                width: TEX_SIZE,
+                height: TEX_SIZE,
+                depth_or_array_layers: TEX_SIZE,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D3,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+
+        let volume_view = volume_tex.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("Volume Sampler"),
+            ..Default::default()
+        });
+
+        let uniforms = Uniforms::new(size.width as f32, size.height as f32, 0.);
+
+        let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Uniform Buffer"),
+            size: std::mem::size_of::<Uniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        queue.write_buffer(&uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
+
+        // Bind group layout
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Bind Group Layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D3,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Bind Group"),
+            layout: &bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: uniform_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&volume_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&sampler),
+                },
+            ],
+        });
+
+        // Shader
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("../main.wgsl").into()),
+        });
+
+        // Pipeline
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Pipeline Layout"),
+            bind_group_layouts: &[&bind_group_layout],
+            push_constant_ranges: &[],
+        });
+
+        let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Render Pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("trivial"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("DDAMain"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
                 ..Default::default()
             },
-            ..Default::default()
-        })
-        .await
-        .unwrap();
-
-    execute_gpu_inner(&device, &queue, numbers).await
-}
-
-pub async fn execute_gpu_inner(
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-    numbers: &[f32],
-) -> Vec<f32> {
-    let (staging_buffers, storage_buffers, bind_group, compute_pipeline) = setup(device, numbers);
-
-    let mut encoder =
-        device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-    {
-        let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("compute pass descriptor"),
-            timestamp_writes: None,
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
         });
-        cpass.set_pipeline(&compute_pipeline);
-        cpass.set_bind_group(0, Some(&bind_group), &[]);
 
-        cpass.dispatch_workgroups(MAX_DISPATCH_SIZE.min(numbers.len() as u32), 1, 1);
+        Self {
+            surface,
+            device,
+            queue,
+            config,
+            size,
+            render_pipeline,
+            uniform_buffer,
+            bind_group,
+            volume_tex,
+            volume_view,
+            sampler,
+            time: 0.0,
+        }
     }
 
-    for (storage_buffer, staging_buffer) in storage_buffers.iter().zip(staging_buffers.iter()) {
-        let stg_size = staging_buffer.size();
-
-        encoder.copy_buffer_to_buffer(
-            storage_buffer, // Source buffer
-            0,
-            staging_buffer, // Destination buffer
-            0,
-            stg_size,
-        );
+    fn resize(&mut self, size @ PhysicalSize { width, height }: winit::dpi::PhysicalSize<u32>) {
+        (width > 0 && height > 0).then(|| {
+            self.size = size;
+            self.config.width = width;
+            self.config.height = height;
+            self.surface.configure(&self.device, &self.config);
+        });
     }
 
-    queue.submit(Some(encoder.finish()));
+    fn update(&mut self, dt: f32) {
+        self.time += dt;
 
-    for staging_buffer in &staging_buffers {
-        let slice = staging_buffer.slice(..);
-        slice.map_async(wgpu::MapMode::Read, |_| {});
+        let uniforms = Uniforms::new(self.size.width as f32, self.size.height as f32, self.time);
+
+        self.queue
+            .write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
     }
 
-    device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+    fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
+        let output = self.surface.get_current_texture()?;
+        let view = output
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
 
-    let mut data = Vec::new();
-    for staging_buffer in &staging_buffers {
-        let slice = staging_buffer.slice(..);
-        let mapped = slice.get_mapped_range();
-        data.extend_from_slice(bytemuck::cast_slice(&mapped));
-        drop(mapped);
-        staging_buffer.unmap();
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Render Encoder"),
+            });
+
+        {
+            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Render Pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+
+            render_pass.set_pipeline(&self.render_pipeline);
+            render_pass.set_bind_group(0, &self.bind_group, &[]);
+            render_pass.draw(0..3, 0..1); // Fullscreen triangle
+        }
+
+        self.queue.submit(std::iter::once(encoder.finish()));
+        output.present();
+
+        Ok(())
     }
-
-    data
 }
 
-fn setup(
-    device: &wgpu::Device,
-    numbers: &[f32],
-) -> (
-    Vec<wgpu::Buffer>,
-    Vec<wgpu::Buffer>,
-    wgpu::BindGroup,
-    wgpu::ComputePipeline,
-) {
-    let cs_module = device.create_shader_module(wgpu::include_wgsl!("../main.wgsl"));
+fn main() {
+    env_logger::init();
 
-    let staging_buffers = create_staging_buffers(device, numbers);
-    let storage_buffers = create_storage_buffers(device, numbers);
+    let (_sender, recv) = mpsc::blocking::channel(128);
+    //let stream = analysis::make_analysis_stream(sender).unwrap();
+    //stream.play().unwrap();
 
-    let (bind_group_layout, bind_group) = setup_binds(&storage_buffers, device);
+    let event_loop = EventLoop::new().unwrap();
+    event_loop.set_control_flow(ControlFlow::Poll);
 
-    let compute_pipeline = setup_pipeline(device, bind_group_layout, cs_module);
-    (
-        staging_buffers,
-        storage_buffers,
-        bind_group,
-        compute_pipeline,
-    )
-}
+    let mut app = App::new(recv);
 
-fn setup_pipeline(
-    device: &wgpu::Device,
-    bind_group_layout: wgpu::BindGroupLayout,
-    cs_module: wgpu::ShaderModule,
-) -> wgpu::ComputePipeline {
-    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("Compute Pipeline Layout"),
-        bind_group_layouts: &[&bind_group_layout],
-        push_constant_ranges: &[],
-    });
-
-    device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-        label: Some("Compute Pipeline"),
-        layout: Some(&pipeline_layout),
-        module: &cs_module,
-        entry_point: Some("main"),
-        compilation_options: Default::default(),
-        cache: None,
-    })
-}
-
-fn setup_binds(
-    storage_buffers: &[wgpu::Buffer],
-    device: &wgpu::Device,
-) -> (wgpu::BindGroupLayout, wgpu::BindGroup) {
-    let bind_group_entries: Vec<wgpu::BindGroupEntry> = storage_buffers
-        .iter()
-        .enumerate()
-        .map(|(bind_idx, buffer)| wgpu::BindGroupEntry {
-            binding: bind_idx as u32,
-            resource: buffer.as_entire_binding(),
-        })
-        .collect();
-
-    let bind_group_layout_entries: Vec<wgpu::BindGroupLayoutEntry> = (0..storage_buffers.len())
-        .map(|bind_idx| wgpu::BindGroupLayoutEntry {
-            binding: bind_idx as u32,
-            visibility: wgpu::ShaderStages::COMPUTE,
-            ty: wgpu::BindingType::Buffer {
-                ty: wgpu::BufferBindingType::Storage { read_only: false },
-                has_dynamic_offset: false,
-                min_binding_size: None,
-            },
-            count: Some(NonZeroU32::new(1).unwrap()),
-        })
-        .collect();
-
-    let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("Custom Storage Bind Group Layout"),
-        entries: &bind_group_layout_entries,
-    });
-
-    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("Combined Storage Bind Group"),
-        layout: &bind_group_layout,
-        entries: &bind_group_entries,
-    });
-
-    (bind_group_layout, bind_group)
-}
-
-fn calculate_chunks(numbers: &[f32], max_buffer_size: u64) -> Vec<&[f32]> {
-    let max_elements_per_chunk = max_buffer_size as usize / std::mem::size_of::<f32>();
-    numbers.chunks(max_elements_per_chunk).collect()
-}
-
-fn create_storage_buffers(device: &wgpu::Device, numbers: &[f32]) -> Vec<wgpu::Buffer> {
-    let chunks = calculate_chunks(numbers, MAX_BUFFER_SIZE);
-
-    chunks
-        .iter()
-        .enumerate()
-        .map(|(e, seg)| {
-            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some(&format!("Storage Buffer-{e}")),
-                contents: bytemuck::cast_slice(seg),
-                usage: wgpu::BufferUsages::STORAGE
-                    | wgpu::BufferUsages::COPY_DST
-                    | wgpu::BufferUsages::COPY_SRC,
-            })
-        })
-        .collect()
-}
-
-fn create_staging_buffers(device: &wgpu::Device, numbers: &[f32]) -> Vec<wgpu::Buffer> {
-    let chunks = calculate_chunks(numbers, MAX_BUFFER_SIZE);
-
-    (0..chunks.len())
-        .map(|e| {
-            let size = std::mem::size_of_val(chunks[e]) as u64;
-
-            device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some(&format!("staging buffer-{e}")),
-                size,
-                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            })
-        })
-        .collect()
-}
-
-async fn run() {
-    let numbers = {
-        const BYTES_PER_GB: usize = 1024 * 1024 * 1024;
-        // 4 bytes per f32
-        let elements = (BYTES_PER_GB as f32 / 4.0) as usize;
-        vec![0.0; elements]
-    };
-    assert!(numbers.iter().all(|n| *n == 0.0));
-    log::info!("All 0.0s");
-    let t1 = std::time::Instant::now();
-    let results = execute_gpu(&numbers).await;
-    log::info!("GPU RUNTIME: {}ms", t1.elapsed().as_millis());
-    assert_eq!(numbers.len(), results.len());
-    assert!(results.iter().all(|n| *n == 1.0));
-    log::info!("All 1.0s");
-}
-
-pub fn main() {
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        env_logger::init();
-        pollster::block_on(run());
-    }
+    event_loop.run_app(&mut app).unwrap();
 }
