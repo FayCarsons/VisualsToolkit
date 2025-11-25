@@ -56,7 +56,21 @@
               libXi
             ]);
 
-            LD_LIBRARY_PATH = "${vulkan-loader}/lib";
+            # Critical: tell the dynamic linker where to find libraries
+            LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath [
+              pkgs.vulkan-loader
+              pkgs.alsa-lib
+              pkgs.jack2
+              pkgs.wayland
+              pkgs.libxkbcommon
+              pkgs.xorg.libX11
+              pkgs.xorg.libXcursor
+              pkgs.xorg.libXi
+              pkgs.xorg.libXrandr
+            ];
+
+            # Tell winit where to find libwayland-client.so specifically
+            WINIT_WAYLAND_LIBNAME = "${pkgs.wayland}/lib/libwayland-client.so";
           };
       }
     );
