@@ -193,7 +193,7 @@ impl<'window> State<'window> {
 
         queue.write_buffer(&uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
 
-        let camera = Camera::new(2., Vec3::new(0.5, 0.5, 0.));
+        let camera = Camera::new(super::CAMERA_RADIUS, super::LOOKAT);
 
         let camera_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Camera Buffer"),
@@ -435,6 +435,7 @@ impl<'window> State<'window> {
         self.input_state.move_camera();
         if self.input_state.any_movement() {
             self.camera.update(self.input_state.pos());
+            self.input_state.clear();
         }
 
         let uniforms = Uniforms::new(self.size.width as f32, self.size.height as f32, self.time);

@@ -1,4 +1,7 @@
-use std::{convert::identity, f32::consts::PI};
+use std::{
+    convert::identity,
+    f32::consts::{PI, TAU},
+};
 
 use glam::{Vec2, Vec3};
 
@@ -28,7 +31,7 @@ impl DirectionKey {
 #[derive(Debug, Default)]
 pub struct InputState {
     pub keystate: [bool; 4],
-    camera_pos: Vec2,
+    movement_delta: Vec2,
 }
 
 impl InputState {
@@ -38,19 +41,19 @@ impl InputState {
         const DELTA_KEY: f32 = 0.05;
 
         if self.keystate[Up as usize] {
-            self.camera_pos.y += DELTA_KEY;
+            self.movement_delta.y += DELTA_KEY;
         }
 
         if self.keystate[Down as usize] {
-            self.camera_pos.y -= DELTA_KEY;
+            self.movement_delta.y -= DELTA_KEY;
         }
 
         if self.keystate[Left as usize] {
-            self.camera_pos.x -= DELTA_KEY;
+            self.movement_delta.x -= DELTA_KEY;
         }
 
         if self.keystate[Right as usize] {
-            self.camera_pos.x += DELTA_KEY;
+            self.movement_delta.x += DELTA_KEY;
         }
     }
 
@@ -59,7 +62,12 @@ impl InputState {
     }
 
     pub fn pos(&self) -> &Vec2 {
-        &self.camera_pos
+        &self.movement_delta
+    }
+
+    pub fn clear(&mut self) {
+        self.keystate = [false; 4];
+        self.movement_delta = Vec2::ZERO;
     }
 }
 
@@ -71,6 +79,7 @@ pub struct Camera {
     lookat: Vec3,
 }
 
+// This padding is awful, can't we get rid of this?
 #[repr(C)]
 #[derive(Debug, Default, Clone, Copy, bytemuck::Zeroable, bytemuck::NoUninit)]
 pub struct CameraUniform {
@@ -96,7 +105,20 @@ impl Camera {
 
     pub fn update(&mut self, Vec2 { x, y }: &Vec2) {
         self.theta += x;
-        self.theta += y.clamp(0.1, PI - 0.1)
+        self.theta %= TAU; // wrap to prevent fp errors
+
+        fn wrap(n: f32, min: f32, max: f32) -> f32 {
+            let range = max - min;
+            let normalized = (n - min) % range;
+            min + if normalized < 0. {
+                normalized + range
+            } else {
+                normalized
+            }
+        }
+
+        self.phi += y;
+        self.phi = wrap(self.phi, 0.1, PI - 0.1)
     }
 
     fn position(&self) -> Vec3 {

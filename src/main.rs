@@ -3,10 +3,13 @@ mod app;
 mod uniforms;
 
 use crate::app::App;
+use glam::Vec3;
 use thingbuf::mpsc;
 use winit::event_loop::{ControlFlow, EventLoop};
 
-pub const TEX_SIZE: u32 = 128;
+pub const TEX_SIZE: u32 = 64;
+pub const CAMERA_RADIUS: f32 = 6.;
+pub const LOOKAT: Vec3 = Vec3::splat(0.5);
 
 fn main() {
     env_logger::init();
