@@ -49,6 +49,7 @@
               pkg-config
               rustToolchain
               wgsl-analyzer
+              fzf
             ]
             ++ (if onLinux then linuxPkgs else [ ]);
 

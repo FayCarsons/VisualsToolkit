@@ -1,4 +1,3 @@
-use glam::Vec3;
 use std::{sync::Arc, time::Instant};
 use thingbuf::mpsc::blocking::Receiver;
 use winit::{application::ApplicationHandler, dpi::PhysicalSize, event::*, window::Window};
@@ -96,15 +95,52 @@ impl ApplicationHandler for App<'_> {
                         }
                     }
                     WindowEvent::CloseRequested => event_loop.exit(),
+                    #[cfg(target_os = "linux")]
                     WindowEvent::KeyboardInput {
                         event:
                             KeyEvent {
-                                logical_key, state, ..
+                                ref logical_key,
+                                ref state,
+                                ..
                             },
                         ..
                     } => {
-                        if let Some(dir) = DirectionKey::from_winit_key(logical_key) {
+                        log::info!(
+                            "{:?} -> {}",
+                            logical_key,
+                            if state.is_pressed() {
+                                "PRESSED"
+                            } else {
+                                "RELEASED"
+                            }
+                        );
+
+                        if let Some(dir) = DirectionKey::from_logical_key(logical_key.clone()) {
                             inner.state.input_state.keystate[dir as usize] = state.is_pressed();
+                        }
+                    }
+                    #[cfg(target_os = "macos")]
+                    WindowEvent::KeyboardInput {
+                        event:
+                            KeyEvent {
+                                ref physical_key,
+                                ref state,
+                                ..
+                            },
+                        ..
+                    } => {
+                        log::info!(
+                            "{:?} -> {}",
+                            physical_key,
+                            if state.is_pressed() {
+                                "PRESSED"
+                            } else {
+                                "RELEASED"
+                            }
+                        );
+
+                        if let Some(dir) = DirectionKey::from_physical_key(*physical_key) {
+                            inner.state.input_state.keystate[dir as usize] = state.is_pressed()
                         }
                     }
                     _ => {}

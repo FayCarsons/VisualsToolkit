@@ -15,7 +15,7 @@ pub enum DirectionKey {
 }
 
 impl DirectionKey {
-    pub fn from_winit_key(key: winit::keyboard::Key) -> Option<Self> {
+    pub fn from_logical_key(key: winit::keyboard::Key) -> Option<Self> {
         use winit::keyboard::Key::Character;
 
         match key {
@@ -24,6 +24,22 @@ impl DirectionKey {
             Character(c) if c == "s" => Some(Self::Down),
             Character(c) if c == "d" => Some(Self::Right),
             _ => None,
+        }
+    }
+
+    pub fn from_physical_key(key: winit::keyboard::PhysicalKey) -> Option<Self> {
+        use winit::keyboard::{KeyCode::*, PhysicalKey::Code};
+
+        if let Code(k) = key {
+            match k {
+                KeyW | KeyK => Some(Self::Up),
+                KeyS | KeyJ => Some(Self::Down),
+                KeyA | KeyH => Some(Self::Left),
+                KeyD | KeyL => Some(Self::Right),
+                _ => None,
+            }
+        } else {
+            None
         }
     }
 }

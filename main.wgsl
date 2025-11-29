@@ -122,7 +122,7 @@ fn DDAMain(@builtin(position) fragcoord: vec4f) -> @location(0) vec4f {
 
     let color = dda(Ray(camera.pos, dir));
 
-    return vec4(mix(Black, White, color), 1.);
+    return vec4(mix(SkyBlue, White, color), 1.);
 }
 
 @group(0) @binding(0)
@@ -269,6 +269,6 @@ fn TexMain(@builtin(global_invocation_id) globalId: vec3u) {
 
     let pos = vec3f(globalId) / vec3f(dims);
     let noise = fbm4d(vec4f(pos * Frequency, time.time * 0.1));
-    let density = pow(max(noise - 0.6, 0.0), 1.5);
+    let density = max(noise - 0.6, 0.) * 0.8;
     textureStore(tex, vec3i(globalId), vec4f(density));
 }
