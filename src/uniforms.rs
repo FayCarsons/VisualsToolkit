@@ -1,6 +1,7 @@
 use std::{
     convert::identity,
     f32::consts::{PI, TAU},
+    ops::Range,
 };
 
 use glam::{Vec2, Vec3};
@@ -163,19 +164,40 @@ impl Camera {
 }
 
 #[repr(C)]
-#[derive(Debug, Default, Clone, Copy, bytemuck::Zeroable, bytemuck::NoUninit)]
+#[derive(Debug, Clone, Copy, bytemuck::Zeroable, bytemuck::NoUninit)]
 pub struct Uniforms {
-    resolution: [f32; 2],
+    resolution: Vec2,
     time: f32,
-    __pad: f32,
+    frame: u32,
 }
 
 impl Uniforms {
-    pub fn new(width: f32, height: f32, time: f32) -> Self {
+    pub fn new(width: f32, height: f32, time: f32, frame: u32) -> Self {
         Self {
-            resolution: [width, height],
+            resolution: Vec2::new(width, height),
             time,
-            ..Default::default()
+            frame,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Zeroable, bytemuck::NoUninit)]
+pub struct Time {
+    delta: f32,
+    frame: u32,
+    seed: f32,
+    __pad: f32,
+}
+
+impl Time {
+    pub fn new(delta: f32, frame: u32) -> Self {
+        let seed = rand::random_range::<f32, Range<f32>>(0f32..10_000f32);
+        Self {
+            delta,
+            frame,
+            seed,
+            __pad: 0.,
         }
     }
 }

@@ -1,10 +1,11 @@
 use std::{sync::Arc, time::Instant};
 use thingbuf::mpsc::blocking::Receiver;
+use wgpu::include_wgsl;
 use winit::{application::ApplicationHandler, dpi::PhysicalSize, event::*, window::Window};
 
 use crate::{
     analysis::Frame,
-    uniforms::{Camera, CameraUniform, DirectionKey, InputState, Uniforms},
+    uniforms::{Camera, CameraUniform, DirectionKey, InputState, Time, Uniforms},
 };
 
 #[allow(private_interfaces)]
@@ -129,6 +130,8 @@ impl ApplicationHandler for App<'_> {
                             },
                         ..
                     } => {
+                        use winit::keyboard::{KeyCode, PhysicalKey};
+
                         log::info!(
                             "{:?} -> {}",
                             physical_key,
@@ -139,7 +142,10 @@ impl ApplicationHandler for App<'_> {
                             }
                         );
 
-                        if let Some(dir) = DirectionKey::from_physical_key(*physical_key) {
+                        if let PhysicalKey::Code(KeyCode::KeyR) = *physical_key {
+                            inner.state.frame = 0;
+                            inner.state.parity = false;
+                        } else if let Some(dir) = DirectionKey::from_physical_key(*physical_key) {
                             inner.state.input_state.keystate[dir as usize] = state.is_pressed()
                         }
                     }
@@ -158,23 +164,32 @@ impl ApplicationHandler for App<'_> {
 
 #[derive(Debug)]
 struct State<'window> {
+    /* Config */
     surface: wgpu::Surface<'window>,
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     size: winit::dpi::PhysicalSize<u32>,
+
+    /* Render */
+    render_bind_group_front: wgpu::BindGroup,
+    render_bind_group_back: wgpu::BindGroup,
     render_pipeline: wgpu::RenderPipeline,
     uniform_buffer: wgpu::Buffer,
     camera_buffer: wgpu::Buffer,
-    bind_group: wgpu::BindGroup,
-    volume_tex: wgpu::Texture,
-    volume_view: wgpu::TextureView,
-    volume_storage_view: wgpu::TextureView,
+
+    /* Compute */
+    compute_time_buffer: wgpu::Buffer,
     compute_pipeline: wgpu::ComputePipeline,
-    compute_bind_group: wgpu::BindGroup,
+    compute_bind_group_front: wgpu::BindGroup,
+    compute_bind_group_back: wgpu::BindGroup,
+
+    /* Input + temporal state */
     input_state: InputState,
     camera: Camera,
     time: f32,
+    frame: u32,
+    parity: bool,
 }
 
 impl<'window> State<'window> {
@@ -218,7 +233,10 @@ impl<'window> State<'window> {
             source: wgpu::ShaderSource::Wgsl(include_str!("../main.wgsl").into()),
         });
 
-        let uniforms = Uniforms::new(size.width as f32, size.height as f32, 0.);
+        let compute_shader = device.create_shader_module(include_wgsl!("../compute.wgsl"));
+
+        /* Render uniforms buffers */
+        let uniforms = Uniforms::new(size.width as f32, size.height as f32, 0., 0);
 
         let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Uniform Buffer"),
@@ -244,8 +262,16 @@ impl<'window> State<'window> {
             bytemuck::cast_slice(&[camera.as_uniform()]),
         );
 
-        let volume_tex = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("Volume Texture"),
+        /* Compute uniforms buffer */
+        let compute_time_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Compute time buffer"),
+            size: std::mem::size_of::<Time>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let volume_tex_a = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Volume Texture A"),
             size: wgpu::Extent3d {
                 width: super::TEX_SIZE,
                 height: super::TEX_SIZE,
@@ -261,7 +287,25 @@ impl<'window> State<'window> {
             view_formats: &[],
         });
 
-        let volume_storage_view = volume_tex.create_view(&wgpu::TextureViewDescriptor::default());
+        let volume_tex_b = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Volume Texture B"),
+            size: wgpu::Extent3d {
+                width: super::TEX_SIZE,
+                height: super::TEX_SIZE,
+                depth_or_array_layers: super::TEX_SIZE,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D3,
+            format: wgpu::TextureFormat::Rgba32Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_DST
+                | wgpu::TextureUsages::STORAGE_BINDING,
+            view_formats: &[],
+        });
+
+        let volume_view_a = volume_tex_a.create_view(&wgpu::TextureViewDescriptor::default());
+        let volume_view_b = volume_tex_b.create_view(&wgpu::TextureViewDescriptor::default());
 
         let compute_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -269,6 +313,16 @@ impl<'window> State<'window> {
                 entries: &[
                     wgpu::BindGroupLayoutEntry {
                         binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                            view_dimension: wgpu::TextureViewDimension::D3,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
                         visibility: wgpu::ShaderStages::COMPUTE,
                         ty: wgpu::BindingType::StorageTexture {
                             access: wgpu::StorageTextureAccess::WriteOnly,
@@ -278,7 +332,7 @@ impl<'window> State<'window> {
                         count: None,
                     },
                     wgpu::BindGroupLayoutEntry {
-                        binding: 1,
+                        binding: 2,
                         visibility: wgpu::ShaderStages::COMPUTE,
                         ty: wgpu::BindingType::Buffer {
                             ty: wgpu::BufferBindingType::Uniform,
@@ -290,17 +344,40 @@ impl<'window> State<'window> {
                 ],
             });
 
-        let compute_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Compute Bind Group"),
+        let compute_bind_group_front = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Compute Bind Group (Front)"),
             layout: &compute_bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&volume_storage_view),
+                    resource: wgpu::BindingResource::TextureView(&volume_view_a),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: uniform_buffer.as_entire_binding(),
+                    resource: wgpu::BindingResource::TextureView(&volume_view_b),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: compute_time_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        let compute_bind_group_back = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Compute Bind Group (Back)"),
+            layout: &compute_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&volume_view_b),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&volume_view_a),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: compute_time_buffer.as_entire_binding(),
                 },
             ],
         });
@@ -315,16 +392,11 @@ impl<'window> State<'window> {
         let compute_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("Compute Pipeline"),
             layout: Some(&compute_pipeline_layout),
-            module: &shader,
+            module: &compute_shader,
             entry_point: Some("TexMain"),
-            compilation_options: wgpu::PipelineCompilationOptions {
-                constants: &[("TexSize", super::TEX_SIZE as f64)],
-                ..Default::default()
-            },
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
             cache: None,
         });
-
-        let volume_view = volume_tex.create_view(&wgpu::TextureViewDescriptor::default());
 
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("Volume Sampler"),
@@ -374,7 +446,7 @@ impl<'window> State<'window> {
             ],
         });
 
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        let render_bind_group_front = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Bind Group"),
             layout: &bind_group_layout,
             entries: &[
@@ -388,7 +460,30 @@ impl<'window> State<'window> {
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: wgpu::BindingResource::TextureView(&volume_view),
+                    resource: wgpu::BindingResource::TextureView(&volume_view_a),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::Sampler(&sampler),
+                },
+            ],
+        });
+
+        let render_bind_group_back = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Bind Group"),
+            layout: &bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: uniform_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: camera_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&volume_view_b),
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
@@ -445,14 +540,19 @@ impl<'window> State<'window> {
             render_pipeline,
             uniform_buffer,
             camera_buffer,
-            bind_group,
-            volume_tex,
-            volume_view,
-            volume_storage_view,
+            render_bind_group_front,
+            render_bind_group_back,
+
+            compute_time_buffer,
             compute_pipeline,
-            compute_bind_group,
+            compute_bind_group_front,
+            compute_bind_group_back,
+
+            /* Uniform + pipeline state */
             time: 0.0,
             camera,
+            frame: 0,
+            parity: false,
             input_state: Default::default(),
         }
     }
@@ -467,14 +567,23 @@ impl<'window> State<'window> {
     }
 
     fn update(&mut self, dt: f32) {
-        self.time += dt;
         self.input_state.move_camera();
         if self.input_state.any_movement() {
             self.camera.update(self.input_state.pos());
             self.input_state.clear();
         }
 
-        let uniforms = Uniforms::new(self.size.width as f32, self.size.height as f32, self.time);
+        let time = Time::new(self.time, self.frame);
+
+        self.queue
+            .write_buffer(&self.compute_time_buffer, 0, bytemuck::cast_slice(&[time]));
+
+        let uniforms = Uniforms::new(
+            self.size.width as f32,
+            self.size.height as f32,
+            self.time,
+            self.frame,
+        );
 
         self.queue
             .write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
@@ -486,6 +595,10 @@ impl<'window> State<'window> {
             0,
             bytemuck::cast_slice(&[camera_uniform]),
         );
+
+        self.time += dt;
+        self.frame += 1;
+        self.parity = !self.parity;
     }
 
     fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
@@ -507,7 +620,15 @@ impl<'window> State<'window> {
             });
 
             compute_pass.set_pipeline(&self.compute_pipeline);
-            compute_pass.set_bind_group(0, &self.compute_bind_group, &[]);
+            compute_pass.set_bind_group(
+                0,
+                if self.parity {
+                    &self.compute_bind_group_front
+                } else {
+                    &self.compute_bind_group_back
+                },
+                &[],
+            );
             let workgroups = super::TEX_SIZE.div_ceil(4);
             compute_pass.dispatch_workgroups(workgroups, workgroups, workgroups);
         }
@@ -530,7 +651,15 @@ impl<'window> State<'window> {
             });
 
             render_pass.set_pipeline(&self.render_pipeline);
-            render_pass.set_bind_group(0, &self.bind_group, &[]);
+            render_pass.set_bind_group(
+                0,
+                if self.parity {
+                    &self.render_bind_group_back
+                } else {
+                    &self.render_bind_group_front
+                },
+                &[],
+            );
             render_pass.draw(0..3, 0..1); // Fullscreen triangle
         }
 

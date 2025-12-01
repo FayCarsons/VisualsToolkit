@@ -8,8 +8,8 @@ use glam::Vec3;
 use thingbuf::mpsc;
 use winit::event_loop::{ControlFlow, EventLoop};
 
-pub const TEX_SIZE: u32 = 32;
-pub const CAMERA_RADIUS: f32 = 5.;
+pub const TEX_SIZE: u32 = 256;
+pub const CAMERA_RADIUS: f32 = 4.;
 pub const LOOKAT: Vec3 = Vec3::splat(0.5);
 
 fn main() {
